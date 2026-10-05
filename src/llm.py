@@ -23,7 +23,7 @@ PROVIDERS = {
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -37,6 +37,7 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.10, 0.40),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -119,19 +120,30 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+            from openai import RateLimitError
+            response = None
+            for attempt in range(15):
+                try:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                        )
+                    break
+                except RateLimitError as e:
+                    sleep_sec = 20 if attempt < 5 else 40
+                    print(f" [429 RateLimit: chat thử lại lần #{attempt+1}, chờ {sleep_sec}s...]", flush=True)
+                    time.sleep(sleep_sec)
+            if response is None:
+                raise RuntimeError("Chat API thất bại sau nhiều lần thử do Rate Limit")
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -157,8 +169,19 @@ class MeteredLLM:
         return text, response.model, response.usage.input_tokens, response.usage.output_tokens
 
     def embed(self, text: str) -> list[float]:
+        from openai import RateLimitError
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = None
+        for attempt in range(15):
+            try:
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                break
+            except RateLimitError as e:
+                sleep_sec = 25 if attempt < 3 else 45
+                print(f" [429 RateLimit: embed thử lại lần #{attempt+1}, chờ {sleep_sec}s...]", flush=True)
+                time.sleep(sleep_sec)
+        if response is None:
+            raise RuntimeError("Embed API thất bại sau nhiều lần thử do Rate Limit")
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
